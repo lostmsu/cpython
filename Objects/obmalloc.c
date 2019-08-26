@@ -1,18 +1,42 @@
 #include "Python.h"
 
 #include <stdbool.h>
+#include <windows.h>
 
 
 /* Defined in tracemalloc.c */
 extern void _PyMem_DumpTraceback(int fd, const void *ptr);
-
 
 /* Python's malloc wrappers (see pymem.h) */
 
 #undef  uint
 #define uint    unsigned int    /* assuming >= 16 bits */
 
+/* When you say memory, my mind reasons in terms of (pointers to) blocks */
+typedef uint8_t block;
+
+/* Pool for small blocks. */
+struct pool_header {
+    union {
+        block* _padding;
+        uint count;
+    } ref;          /* number of allocated blocks    */
+    block* freeblock;                   /* pool's free list head         */
+    struct pool_header* nextpool;       /* next pool of this size class  */
+    struct pool_header* prevpool;       /* previous pool       ""        */
+    uint arenaindex;                    /* index into arenas of base adr */
+    uint szidx;                         /* block size class index        */
+    uint nextoffset;                    /* bytes to virgin block         */
+    uint maxnextoffset;                 /* largest valid nextoffset      */
+};
+
+typedef struct pool_header* poolp;
+
+static HANDLE usedpoolsDataBreakpoint = 0;
+static block** freeblock_ptr = 0;
+
 /* Forward declaration */
+static poolp *getUsedPools();
 static void* _PyMem_DebugRawMalloc(void *ctx, size_t size);
 static void* _PyMem_DebugRawCalloc(void *ctx, size_t nelem, size_t elsize);
 static void* _PyMem_DebugRawRealloc(void *ctx, void *ptr, size_t size);
@@ -71,6 +95,238 @@ static void _PyMem_SetupDebugHooksDomain(PyMemAllocatorDomain domain);
 #    define ARENAS_USE_MMAP
 #  endif
 #endif
+
+// Hardware Breakpoint Functions
+
+typedef struct
+{
+    void* a;
+    HANDLE hT;
+    HWBRK_TYPE Type;
+    HWBRK_SIZE Size;
+    HANDLE hEv;
+    int iReg;
+    int Opr;
+    bool SUCC;
+} HWBRK;
+
+
+void SetBits(DWORD_PTR* dw, int lowBit, int bits, int newValue)
+{
+    DWORD_PTR mask = (1 << bits) - 1;
+    *dw = (*dw & ~(mask << lowBit)) | (newValue << lowBit);
+}
+
+static DWORD WINAPI th(LPVOID lpParameter)
+{
+    HWBRK* h = (HWBRK*)lpParameter;
+    int j = 0;
+    int y = 0;
+
+    j = SuspendThread(h->hT);
+    y = GetLastError();
+
+    CONTEXT ct = { 0 };
+    ct.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    j = GetThreadContext(h->hT, &ct);
+    y = GetLastError();
+
+    int FlagBit = 0;
+
+    bool Dr0Busy = false;
+    bool Dr1Busy = false;
+    bool Dr2Busy = false;
+    bool Dr3Busy = false;
+    if (ct.Dr7 & 1)
+        Dr0Busy = true;
+    if (ct.Dr7 & 4)
+        Dr1Busy = true;
+    if (ct.Dr7 & 16)
+        Dr2Busy = true;
+    if (ct.Dr7 & 64)
+        Dr3Busy = true;
+
+    if (h->Opr == 1)
+    {
+        // Remove
+        if (h->iReg == 0)
+        {
+            FlagBit = 0;
+            ct.Dr0 = 0;
+            Dr0Busy = false;
+        }
+        if (h->iReg == 1)
+        {
+            FlagBit = 2;
+            ct.Dr1 = 0;
+            Dr1Busy = false;
+        }
+        if (h->iReg == 2)
+        {
+            FlagBit = 4;
+            ct.Dr2 = 0;
+            Dr2Busy = false;
+        }
+        if (h->iReg == 3)
+        {
+            FlagBit = 6;
+            ct.Dr3 = 0;
+            Dr3Busy = false;
+        }
+
+        ct.Dr7 &= ~(1 << FlagBit);
+    }
+    else
+    {
+        if (!Dr0Busy)
+        {
+            h->iReg = 0;
+            ct.Dr0 = (DWORD_PTR)h->a;
+            Dr0Busy = true;
+        }
+        else
+            if (!Dr1Busy)
+            {
+                h->iReg = 1;
+                ct.Dr1 = (DWORD_PTR)h->a;
+                Dr1Busy = true;
+            }
+            else
+                if (!Dr2Busy)
+                {
+                    h->iReg = 2;
+                    ct.Dr2 = (DWORD_PTR)h->a;
+                    Dr2Busy = true;
+                }
+                else
+                    if (!Dr3Busy)
+                    {
+                        h->iReg = 3;
+                        ct.Dr3 = (DWORD_PTR)h->a;
+                        Dr3Busy = true;
+                    }
+                    else
+                    {
+                        h->SUCC = false;
+                        j = ResumeThread(h->hT);
+                        y = GetLastError();
+                        SetEvent(h->hEv);
+                        return 0;
+                    }
+        ct.Dr6 = 0;
+        int st = 0;
+        if (h->Type == HWBRK_TYPE_CODE)
+            st = 0;
+        if (h->Type == HWBRK_TYPE_READWRITE)
+            st = 3;
+        if (h->Type == HWBRK_TYPE_WRITE)
+            st = 1;
+        int le = 0;
+        if (h->Size == HWBRK_SIZE_1)
+            le = 0;
+        if (h->Size == HWBRK_SIZE_2)
+            le = 1;
+        if (h->Size == HWBRK_SIZE_4)
+            le = 3;
+        if (h->Size == HWBRK_SIZE_8)
+            le = 2;
+
+        SetBits(&ct.Dr7, 16 + h->iReg * 4, 2, st);
+        SetBits(&ct.Dr7, 18 + h->iReg * 4, 2, le);
+        SetBits(&ct.Dr7, h->iReg * 2, 1, 1);
+    }
+
+
+
+    ct.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    j = SetThreadContext(h->hT, &ct);
+    y = GetLastError();
+
+    ct.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    j = GetThreadContext(h->hT, &ct);
+    y = GetLastError();
+
+    j = ResumeThread(h->hT);
+    y = GetLastError();
+
+    h->SUCC = true;
+
+    SetEvent(h->hEv);
+    return 0;
+}
+
+HANDLE SetHardwareBreakpoint(HANDLE hThread, HWBRK_TYPE Type, HWBRK_SIZE Size, void* s)
+{
+    HWBRK* h = calloc(1, sizeof(HWBRK));
+    h->a = s;
+    h->Size = Size;
+    h->Type = Type;
+    h->hT = hThread;
+
+
+    if (hThread == GetCurrentThread())
+    {
+        DWORD pid = GetCurrentThreadId();
+        h->hT = OpenThread(THREAD_ALL_ACCESS, 0, pid);
+    }
+
+    h->hEv = CreateEvent(0, 0, 0, 0);
+    h->Opr = 0; // Set Break
+    HANDLE hY = CreateThread(0, 0, th, (LPVOID)h, 0, 0);
+    WaitForSingleObject(h->hEv, INFINITE);
+    CloseHandle(h->hEv);
+    h->hEv = 0;
+
+    if (hThread == GetCurrentThread())
+    {
+        CloseHandle(h->hT);
+    }
+    h->hT = hThread;
+
+    if (!h->SUCC)
+    {
+        free(h);
+        return 0;
+    }
+
+
+    return (HANDLE)h;
+}
+
+
+
+
+
+
+bool RemoveHardwareBreakpoint(HANDLE hBrk)
+{
+    HWBRK* h = (HWBRK*)hBrk;
+    if (!h)
+        return false;
+
+    bool C = false;
+    if (h->hT == GetCurrentThread())
+    {
+        DWORD pid = GetCurrentThreadId();
+        h->hT = OpenThread(THREAD_ALL_ACCESS, 0, pid);
+        C = true;
+    }
+
+    h->hEv = CreateEvent(0, 0, 0, 0);
+    h->Opr = 1; // Remove Break
+    HANDLE hY = CreateThread(0, 0, th, (LPVOID)h, 0, 0);
+    WaitForSingleObject(h->hEv, INFINITE);
+    CloseHandle(h->hEv);
+    h->hEv = 0;
+
+    if (C)
+    {
+        CloseHandle(h->hT);
+    }
+
+    free(h);
+    return true;
+}
 
 /* Forward declaration */
 static void* _PyObject_Malloc(void *ctx, size_t size);
@@ -890,24 +1146,6 @@ static int running_on_valgrind = -1;
 #define SIMPLELOCK_LOCK(lock)   /* acquire released lock */
 #define SIMPLELOCK_UNLOCK(lock) /* release acquired lock */
 
-/* When you say memory, my mind reasons in terms of (pointers to) blocks */
-typedef uint8_t block;
-
-/* Pool for small blocks. */
-struct pool_header {
-    union { block *_padding;
-            uint count; } ref;          /* number of allocated blocks    */
-    block *freeblock;                   /* pool's free list head         */
-    struct pool_header *nextpool;       /* next pool of this size class  */
-    struct pool_header *prevpool;       /* previous pool       ""        */
-    uint arenaindex;                    /* index into arenas of base adr */
-    uint szidx;                         /* block size class index        */
-    uint nextoffset;                    /* bytes to virgin block         */
-    uint maxnextoffset;                 /* largest valid nextoffset      */
-};
-
-typedef struct pool_header *poolp;
-
 /* Record keeping for arenas. */
 struct arena_object {
     /* The address of the arena, as returned by malloc.  Note that 0
@@ -1096,6 +1334,10 @@ static poolp usedpools[2 * ((NB_SMALL_SIZE_CLASSES + 7) / 8) * 8] = {
 #endif /* NB_SMALL_SIZE_CLASSES > 16 */
 #endif /* NB_SMALL_SIZE_CLASSES >  8 */
 };
+
+static poolp* getUsedPools() {
+    return usedpools;
+}
 
 /*==========================================================================
 Arena management.
@@ -1361,6 +1603,19 @@ address_in_range(void *p, poolp pool)
 }
 
 
+static void UpdateDataBreakpoint() {
+    block** new_freeblock_ptr = &(usedpools[10]->freeblock);
+    if (freeblock_ptr != new_freeblock_ptr) {
+        if (usedpoolsDataBreakpoint)
+            RemoveHardwareBreakpoint(usedpoolsDataBreakpoint);
+        freeblock_ptr = new_freeblock_ptr;
+        usedpoolsDataBreakpoint = SetHardwareBreakpoint(GetCurrentThread(),
+            HWBRK_TYPE_WRITE, HWBRK_SIZE_4, freeblock_ptr);
+        if (!usedpoolsDataBreakpoint || !freeblock_ptr)
+            __debugbreak();
+    }
+}
+
 /*==========================================================================*/
 
 /* pymalloc allocator
@@ -1401,6 +1656,9 @@ pymalloc_alloc(void *ctx, void **ptr_p, size_t nbytes)
     }
 
     LOCK();
+
+    UpdateDataBreakpoint();
+    
     /*
      * Most frequent paths first
      */
@@ -1512,6 +1770,8 @@ pymalloc_alloc(void *ctx, void **ptr_p, size_t nbytes)
             bp = pool->freeblock;
             assert(bp != NULL);
             pool->freeblock = *(block **)bp;
+            if (size == 5 && pool->freeblock && (abs((char*)pool->freeblock - (char*)pool) > 0x10000))
+                __debugbreak();
             goto success;
         }
         /*
@@ -1525,6 +1785,8 @@ pymalloc_alloc(void *ctx, void **ptr_p, size_t nbytes)
         pool->nextoffset = POOL_OVERHEAD + (size << 1);
         pool->maxnextoffset = POOL_SIZE - size;
         pool->freeblock = bp + size;
+        if (size == 5 && pool->freeblock && (abs((char*)pool->freeblock - (char*)pool) > 0x10000))
+            __debugbreak();
         *(block **)(pool->freeblock) = NULL;
         goto success;
     }
@@ -1556,6 +1818,7 @@ pymalloc_alloc(void *ctx, void **ptr_p, size_t nbytes)
     goto init_pool;
 
 success:
+    UpdateDataBreakpoint();
     UNLOCK();
     assert(bp != NULL);
     *ptr_p = (void *)bp;
@@ -1582,7 +1845,6 @@ _PyObject_Malloc(void *ctx, size_t nbytes)
     }
     return ptr;
 }
-
 
 static void *
 _PyObject_Calloc(void *ctx, size_t nelem, size_t elsize)
@@ -1641,6 +1903,10 @@ pymalloc_free(void *ctx, void *p)
      */
     assert(pool->ref.count > 0);            /* else it was empty */
     *(block **)p = lastfree = pool->freeblock;
+    if (((int)p & 1) != 0)
+        __debugbreak();
+    if (p && (abs((char*)p - (char*)pool) > 0x10000))
+        __debugbreak();
     pool->freeblock = (block *)p;
     if (!lastfree) {
         /* Pool was full, so doesn't currently live in any list:
@@ -1817,6 +2083,7 @@ pymalloc_free(void *ctx, void *p)
     goto success;
 
 success:
+    UpdateDataBreakpoint();
     UNLOCK();
     return 1;
 }
